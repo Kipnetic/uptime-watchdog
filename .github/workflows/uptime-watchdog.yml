@@ -1,0 +1,118 @@
+# Apex Hub external uptime watchdog, moved here from Kipnetic/apex-hub on 2026-09-18.
+#
+# WHY A SEPARATE PUBLIC REPO. Actions minutes are free on public repositories. A
+# 10-minute schedule bills about 4,300 minutes a month because every run rounds up
+# to a whole minute, more than twice the free allowance for private repos. Nothing
+# secret lives here: the health URL is already public, and the token that files
+# issues in the private apex-hub repo is an encrypted Actions secret.
+#
+# The token (APEX_ISSUES_TOKEN) is a fine-grained PAT scoped to Kipnetic/apex-hub
+# with Issues read/write and nothing else. If it is missing or expired, the issue
+# step fails and the run goes red, so a broken alarm is visible here rather than
+# silent.
+#
+# External uptime watchdog.
+#
+# WHY THIS LIVES IN GITHUB ACTIONS AND NOT IN THE APP.
+# On 2026-08-30 the api was OOM-killed and stayed down ~5h15m with nobody
+# alerted. The existing `ops.job_health` monitor could not have caught it: that
+# monitor runs INSIDE the api process, so when the api died the watchdog died
+# with it. A process cannot alarm about its own death. This job runs on
+# GitHub's infrastructure, so it survives the loss of the entire Railway
+# project.
+#
+# NOTE ON STYLE: no heredocs anywhere below. A shell heredoc nested inside a
+# YAML block scalar puts its terminator at column 0, which silently ends the
+# block and makes the whole workflow unparseable : and an unparseable watchdog
+# is a watchdog that never runs, which is the exact silent failure this file
+# exists to prevent. Untrusted values go through `env:` rather than `${{ }}`
+# interpolation into shell, for the same do-not-break-the-alarm reason.
+name: Uptime watchdog
+
+on:
+  schedule:
+    # Every 10 minutes. GitHub schedules are best-effort and can lag under
+    # load, which is fine: this is a safety net for multi-hour outages, not a
+    # latency monitor.
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: uptime-watchdog
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    env:
+      API_HEALTH_URL: ${{ vars.API_HEALTH_URL || 'https://api-production-b9f1.up.railway.app/health' }}
+      ISSUE_LABEL: outage
+      ISSUE_TITLE: API is down
+      GH_TOKEN: ${{ secrets.APEX_ISSUES_TOKEN }}
+      GH_REPO: Kipnetic/apex-hub
+    steps:
+      - name: Probe API health
+        id: probe
+        run: |
+          # Three attempts before declaring an outage. A single failed request
+          # is a blip; the failure this exists to catch lasts hours, so trading
+          # ~40s of detection latency for immunity to flapping is the right way
+          # round. A noisy watchdog gets muted, and a muted watchdog is how the
+          # next real outage is missed.
+          healthy=false
+          last_code=000
+          for attempt in 1 2 3; do
+            last_code=$(curl -s -o /tmp/body.json -w '%{http_code}' --max-time 20 "$API_HEALTH_URL" || echo 000)
+            echo "attempt $attempt -> HTTP $last_code"
+            if [ "$last_code" = "200" ]; then healthy=true; break; fi
+            if [ "$attempt" -lt 3 ]; then sleep 20; fi
+          done
+          echo "healthy=$healthy" >> "$GITHUB_OUTPUT"
+          echo "code=$last_code" >> "$GITHUB_OUTPUT"
+
+      - name: Open an issue when down
+        if: steps.probe.outputs.healthy != 'true'
+        env:
+          LAST_CODE: ${{ steps.probe.outputs.code }}
+        run: |
+          # One open issue per outage, never one per tick. Ten-minute polling
+          # would otherwise file ~30 issues across a 5h outage.
+          existing=$(gh issue list --state open --label "$ISSUE_LABEL" --search "$ISSUE_TITLE in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "Issue #$existing already open; not filing a duplicate."
+            exit 1
+          fi
+          body=/tmp/issue.md
+          {
+            echo "The uptime watchdog could not reach the API health endpoint on 3 consecutive attempts."
+            echo ""
+            echo "- Endpoint: $API_HEALTH_URL"
+            echo "- Last HTTP status: $LAST_CODE"
+            echo "- Detected: $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
+            echo ""
+            echo "First thing to check is whether the container is alive at all:"
+            echo ""
+            echo "    railway status --json"
+            echo ""
+            echo "A CRASHED api with deploymentStopped true means it exhausted its restart"
+            echo "retries and will NOT come back on its own. Restore it with:"
+            echo ""
+            echo "    railway redeploy --service api --yes"
+            echo ""
+            echo "Then check whether memory was the cause. job_runs.detail carries peak RSS"
+            echo "per job, and the nightly MLS chain at 07:00 UTC is the known spike."
+            echo ""
+            echo "This issue closes automatically once health returns."
+          } > "$body"
+          gh issue create --title "$ISSUE_TITLE" --label "$ISSUE_LABEL" --body-file "$body"
+          exit 1
+
+      - name: Close the outage issue when recovered
+        if: steps.probe.outputs.healthy == 'true'
+        run: |
+          numbers=$(gh issue list --state open --label "$ISSUE_LABEL" --search "$ISSUE_TITLE in:title" --json number --jq '.[].number')
+          for n in $numbers; do
+            gh issue close "$n" --comment "Health check recovered at $(date -u '+%Y-%m-%d %H:%M:%S') UTC."
+          done
